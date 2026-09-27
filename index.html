@@ -1,0 +1,299 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>协同编辑器 · Yjs</title>
+
+<!-- 内联 SVG favicon，避免 404 -->
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>📝</text></svg>">
+
+<!-- ★ importmap 是核心：保证 yjs 只加载一份 -->
+<script type="importmap">
+{
+  "imports": {
+    "yjs": "https://esm.sh/yjs@13.6.32",
+    "y-websocket": "https://esm.sh/y-websocket@3?external=yjs"
+  }
+}
+</script>
+
+<style>
+  body {
+    font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+    max-width: 720px; margin: 40px auto; padding: 0 16px;
+  }
+  #editor {
+    width: 100%; box-sizing: border-box;
+    min-height: 260px; padding: 16px;
+    border: 1px solid #ddd; border-radius: 8px;
+    font-size: 16px; line-height: 1.7;
+    font-family: inherit; resize: vertical; outline: none;
+    transition: background .15s, border-color .15s;
+  }
+  #editor:focus { border-color: #4a90d9; box-shadow: 0 0 0 3px rgba(74,144,217,.15); }
+  #editor.locked { background: #f7f7f7; color: #666; cursor: pointer; }
+
+  #status {
+    margin-top: 10px; font-size: 13px; color: #666;
+    display: flex; justify-content: space-between; align-items: center;
+  }
+  #lockBar { margin-top: 6px; font-size: 13px; }
+  #users   { font-size: 13px; color: #666; margin-top: 6px; }
+  #cursors { font-size: 13px; color: #666; margin-top: 4px; }
+
+  .dot {
+    display: inline-block; width: 8px; height: 8px; border-radius: 50%;
+    margin-right: 6px; vertical-align: middle;
+  }
+  .dot.on   { background: #3cba54; }
+  .dot.off  { background: #ccc; }
+  .dot.warn { background: #f4b400; }
+
+  .lock-on  { color: #2a7; }
+  .lock-off { color: #b35; }
+
+  .swatch {
+    display: inline-block; width: 10px; height: 10px; border-radius: 2px;
+    margin-right: 4px; vertical-align: middle;
+  }
+</style>
+</head>
+<body>
+
+<textarea id="editor" spellcheck="false" placeholder="点击此处获取编辑权…" readonly></textarea>
+
+<div id="status">
+  <span><span id="dot" class="dot off"></span><span id="conn">连接中…</span></span>
+  <span id="version">rev -</span>
+</div>
+<div id="lockBar"><span id="lockStatus" class="lock-off">🔒 只读</span></div>
+<div id="users">在线用户（-）：-</div>
+<div id="cursors">光标：-</div>
+
+<script type="module">
+import * as Y from 'yjs';
+import { WebsocketProvider } from 'y-websocket';
+
+console.log('[yjs] loaded, version =', Y.version ?? '(dev)');
+console.log('[yjs] instanceof check:', new Y.Doc() instanceof Y.Doc);
+
+// ---------- 固定 clientId ----------
+function getClientId() {
+  let id = sessionStorage.getItem('collab-client-id');
+  if (!id) {
+    id = Math.random().toString(36).slice(2, 8);
+    sessionStorage.setItem('collab-client-id', id);
+  }
+  return id;
+}
+const clientId = getClientId();
+
+function colorFromId(id) {
+  let h = 0;
+  for (let i = 0; i < id.length; i++) h = (h * 31 + id.charCodeAt(i)) % 360;
+  return `hsl(${h}, 65%, 55%)`;
+}
+const myColor = colorFromId(clientId);
+
+// ---------- DOM ----------
+const editor    = document.getElementById('editor');
+const connEl    = document.getElementById('conn');
+const dotEl     = document.getElementById('dot');
+const usersEl   = document.getElementById('users');
+const cursorsEl = document.getElementById('cursors');
+const lockEl    = document.getElementById('lockStatus');
+const verEl     = document.getElementById('version');
+
+// ---------- Yjs 初始化 ----------
+const ydoc  = new Y.Doc();
+const yText = ydoc.getText('shared-text');
+
+window.__ydoc  = ydoc;
+window.__yText = yText;
+
+const provider = new WebsocketProvider(
+  (location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host,
+  'collab-room',
+  ydoc
+);
+window.__provider = provider;
+
+const awareness = provider.awareness;
+awareness.setLocalStateField('user', { name: clientId, color: myColor });
+
+// ---------- 双向绑定 ----------
+let applyingRemote = false;
+let hasLock = false;
+
+function renderFromY() {
+  const text = yText.toString();
+  if (text === editor.value) return;
+  const caret = editor.selectionStart;
+  applyingRemote = true;
+  editor.value = text;
+  applyingRemote = false;
+  const pos = Math.min(caret, text.length);
+  editor.setSelectionRange(pos, pos);
+  console.log('[renderFromY]', JSON.stringify(text));
+}
+
+yText.observe((event, tr) => {
+  console.log('[yText.observe]', {
+    text: yText.toString(),
+    origin: typeof tr.origin === 'object'
+      ? (tr.origin?.constructor?.name || 'obj')
+      : tr.origin,
+  });
+  if (!applyingRemote) renderFromY();
+});
+
+editor.addEventListener('input', () => {
+  if (applyingRemote) return;
+  if (!hasLock) { renderFromY(); return; }
+
+  const newText = editor.value;
+  const oldText = yText.toString();
+
+  // 简易前后缀 diff
+  let s = 0;
+  while (s < oldText.length && s < newText.length && oldText[s] === newText[s]) s++;
+  let eo = oldText.length, en = newText.length;
+  while (eo > s && en > s && oldText[eo - 1] === newText[en - 1]) { eo--; en--; }
+
+  console.log('[local diff]', { s, eo, en });
+
+  ydoc.transact(() => {
+    if (eo > s) yText.delete(s, eo - s);
+    if (en > s) yText.insert(s, newText.slice(s, en));
+  }, 'local-input');
+});
+
+// ---------- 光标广播 ----------
+function pushCursor() {
+  if (document.activeElement !== editor) return;
+  awareness.setLocalStateField('cursor', {
+    anchor: editor.selectionStart,
+    head:   editor.selectionEnd,
+  });
+}
+['keyup', 'click', 'select', 'focus'].forEach(ev =>
+  editor.addEventListener(ev, pushCursor)
+);
+editor.addEventListener('blur', () => {
+  awareness.setLocalStateField('cursor', null);
+});
+
+// ---------- 编辑锁（走 Awareness）----------
+const LOCK_FIELD = 'lock';
+
+function acquireLock() {
+  if (!provider.wsconnected) return;
+  for (const [id, state] of awareness.getStates()) {
+    if (id !== awareness.clientID && state[LOCK_FIELD]) return;
+  }
+  awareness.setLocalStateField(LOCK_FIELD, true);
+}
+function releaseLock() {
+  awareness.setLocalStateField(LOCK_FIELD, null);
+}
+
+let releaseTimer = null;
+function scheduleRelease() {
+  clearTimeout(releaseTimer);
+  releaseTimer = setTimeout(() => {
+    if (document.activeElement !== editor) releaseLock();
+  }, 3000);
+}
+
+// ---------- UI 刷新 ----------
+function refreshUI() {
+  let remoteHolder = null;
+  for (const [id, state] of awareness.getStates()) {
+    if (id !== awareness.clientID && state[LOCK_FIELD]) {
+      remoteHolder = state.user?.name || String(id).slice(0, 4);
+      break;
+    }
+  }
+  const myLock = awareness.getLocalState()?.[LOCK_FIELD] === true;
+  hasLock = myLock && !remoteHolder;
+
+  // 锁状态
+  if (hasLock) {
+    editor.readOnly = false;
+    editor.classList.remove('locked');
+    editor.placeholder = '在这里输入…';
+    lockEl.textContent = '✏️ 你可以编辑';
+    lockEl.className = 'lock-on';
+  } else {
+    editor.readOnly = true;
+    editor.classList.add('locked');
+    editor.placeholder = '只读模式（点击尝试获取编辑权）';
+    lockEl.textContent = '🔒 只读'
+      + (remoteHolder ? `（${remoteHolder} 正在编辑）` : '（点击获取编辑权）');
+    lockEl.className = 'lock-off';
+  }
+
+  // 用户列表 + 光标
+  const users = [], cursors = [];
+  for (const [id, state] of awareness.getStates()) {
+    const name  = state.user?.name  || String(id).slice(0, 4);
+    const color = state.user?.color || '#888';
+    const isMe  = id === awareness.clientID;
+    users.push(`<span class="swatch" style="background:${color}"></span>${name}${isMe ? '（你）' : ''}`);
+    if (state.cursor && !isMe) {
+      cursors.push(`<span class="swatch" style="background:${color}"></span>${name} @ ${state.cursor.anchor}`);
+    }
+  }
+  usersEl.innerHTML   = `在线用户（${users.length}）：` + (users.join('，') || '-');
+  cursorsEl.innerHTML = '光标：' + (cursors.join('，') || '-');
+}
+awareness.on('change', refreshUI);
+
+// ---------- 编辑器事件 ----------
+editor.addEventListener('focus', () => { clearTimeout(releaseTimer); acquireLock(); });
+editor.addEventListener('click', () => acquireLock());
+editor.addEventListener('blur', () => scheduleRelease());
+
+// ---------- 连接状态 ----------
+function setConn(state, text) {
+  dotEl.className = 'dot ' + state;
+  connEl.textContent = text;
+}
+
+provider.on('status', ({ status }) => {
+  console.log('[provider.status]', status);
+  if (status === 'connected') {
+    setConn('on', '已连接 · ' + clientId);
+    renderFromY();
+    refreshUI();
+  } else {
+    setConn('warn', '连接中…');
+  }
+});
+
+provider.on('sync', isSynced => {
+  console.log('[provider.sync]', isSynced);
+  if (isSynced) {
+    renderFromY();
+    verEl.textContent = '已同步';
+  }
+});
+
+provider.on('connection-close', () => {
+  console.warn('[provider.connection-close]');
+  setConn('off', '连接已断开，重连中…');
+  hasLock = false;
+  refreshUI();
+});
+
+provider.on('connection-error', e => {
+  console.error('[provider.connection-error]', e);
+  setConn('off', '连接失败，重连中…');
+});
+
+// 初始渲染
+renderFromY();
+refreshUI();
+</script>
+</body>
+</html>

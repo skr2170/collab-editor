@@ -1,0 +1,13 @@
+{
+  "name": "collab-editor",
+  "type": "module",
+  "scripts": { "start": "node server.mjs" },
+  "dependencies": {
+    "@y/websocket-server": "0.1.1",
+    "yjs": "^13.6.20",
+    "ws": "^8.18.0"
+  },
+  "overrides": {
+    "yjs": "^13.6.20"
+  }
+}
